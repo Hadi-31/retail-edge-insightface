@@ -11,10 +11,9 @@ import numpy as np
 # -----------------------------
 # Performance / Lite mode flags
 # -----------------------------
-FSKIP = int(os.getenv("FRAME_SKIP", "0"))          # عدد الإطارات التي تُتخطّى بين كل معالجة (مثلاً 2 يعني تعالج 1 وتترك 2)
-PERSON_IN_SZ = int(os.getenv("PERSON_IN_SZ", "640"))  # أقصى بُعد للصورة قبل كشف الأشخاص (downscale)
-FACE_DET_SIZE = int(os.getenv("FACE_DET_SIZE", "640")) # det_size لـ InsightFace (أصغر = أسرع)
-LITE_MODE = os.getenv("LITE_MODE", "0") == "1"        # وضع خفيف (اختياري)
+FSKIP = int(os.getenv("FRAME_SKIP", "0"))            # عدد الإطارات التي تُتخطّى بين كل معالجة
+LITE_MODE = os.getenv("LITE_MODE", "0") == "1"       # وضع خفيف (اختياري)
+# ملاحظة: PERSON_IN_SZ يُستخدم داخل PersonDetector فقط إذا رغبت، لا نستخدمه هنا الآن
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -30,8 +29,8 @@ def main():
 
     # Components
     person_det = PersonDetector()
-    # مرّر حجم كشف أصغر لـ InsightFace لتسريع الكشف (خصوصاً في LITE_MODE)
-    face_attr = FaceAttrs(det_size=(FACE_DET_SIZE, FACE_DET_SIZE))
+    # مع نسخة DeepFace الحالية، لا نحتاج det_size هنا
+    face_attr = FaceAttrs()
     tracker = IOUTracker(iou_thresh=0.4, max_age=30)
     ad_engine = AdEngine(args.config)
     disp = Display(blur_faces=args.blur_faces)
@@ -58,9 +57,8 @@ def main():
         # 1) Frame skipping (لتخفيف الحمل)
         # -----------------------------
         if FSKIP and (frame_index % (FSKIP + 1) != 0):
-            # نعرض آخر إطار (اختياري) للحفاظ على نافذة العرض سلسة
             try:
-                cv2.imshow("Retail Edge InsightFace", frame)
+                cv2.imshow("Retail Edge", frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == 27 or key == ord('q'):
                     break
@@ -69,26 +67,11 @@ def main():
             frame_index += 1
             continue
 
-        # -----------------------------------------
-        # 2) Downscale قبل كشف الأشخاص (أداء أعلى)
-        # -----------------------------------------
-        h0, w0 = frame.shape[:2]
-        if PERSON_IN_SZ > 0:
-            scale = PERSON_IN_SZ / max(h0, w0)
-        else:
-            scale = 1.0
-        if scale < 1.0:
-            small = cv2.resize(frame, (int(w0 * scale), int(h0 * scale)))
-        else:
-            small = frame
-
-        # كشف الأشخاص على الصورة المصغّرة
-        dets = person_det.infer(small) or []
-        # رجّع الصناديق لمقاس الإطار الأصلي إذا كنّا مصغّرين
-        if scale < 1.0:
-            for d in dets:
-                x1, y1, x2, y2 = d['box']
-                d['box'] = (x1 / scale, y1 / scale, x2 / scale, y2 / scale)
+        # -----------------------------
+        # 2) Person detection (بدون أي تصغير هنا)
+        #    التصغير إن لزم يتم داخل PersonDetector فقط
+        # -----------------------------
+        dets = person_det.infer(frame) or []
 
         # فلترة حسب الثقة
         dets = [d for d in dets if d.get('conf', 1.0) >= min_person_conf]
@@ -98,16 +81,12 @@ def main():
         boxes = [t['box'] for t in tracked]
 
         # -----------------------------
-        # 3) Face analysis (أخف + ROI)
-        #    - نمرّر الإطار الكامل كما هو، لكن FaceAttrs نفسه
-        #      يعمل بحجم det_size أصغر (FACE_DET_SIZE)
+        # 3) Face analysis (ROI داخل FaceAttrs لسرعة أعلى)
         # -----------------------------
         face_infos = face_attr.analyze(frame, boxes)
 
         # تأكد المحاذاة بين tracked و face_infos
         if len(face_infos) != len(tracked):
-            # في حالات نادرة، خلّي القوائم بنفس الطول
-            # نملأ ناقص بـ no-face
             pad = len(tracked) - len(face_infos)
             face_infos += [{'has_face': False, 'age': None, 'gender': None,
                             'expression': None, 'face_box': None, 'is_child': False}] * max(0, pad)
@@ -122,7 +101,6 @@ def main():
 
         # رسم المعلومات
         for p in enriched:
-            # في LITE_MODE، نخلي الليبل أقصر لتقليل الكتابة على كل فريم
             if LITE_MODE:
                 label = f"ID {p['id']} | {p['clothing_style']}"
             else:
@@ -133,12 +111,11 @@ def main():
 
         # عرض
         try:
-            cv2.imshow("Retail Edge InsightFace", frame)
+            cv2.imshow("Retail Edge", frame)
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord('q'):
                 break
         except Exception:
-            # في بيئات بدون شاشة (headless) نتجاهل العرض
             pass
 
         frame_index += 1
