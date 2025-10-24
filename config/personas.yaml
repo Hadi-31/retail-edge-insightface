@@ -1,8 +1,8 @@
 global:
-  min_person_conf: 0.3
-  min_face_conf: 0.5
-  persistence_frames: 5
-  cooldown_seconds: 45
+  min_person_conf: 0.35
+  min_face_conf: 0.6
+  persistence_frames: 8    
+  cooldown_seconds: 60     
 
 rules:
   - name: family_combo

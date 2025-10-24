@@ -24,12 +24,14 @@ class PersonDetector:
       - USE_MEMRYX=1               : enable MemryX backend
       - MX_DFP_PERSON=<path.dfp>   : path to your YOLO .dfp (default: models/yolo_person.dfp)
       - MIN_SCORE=0.30             : confidence threshold (default 0.30)
-      - NMS_IOU=0.50               : IOU for NMS on MemryX path (default 0.50)
+      - NMS_IOU=0.50               : IOU for NMS (default 0.50)
+      - PERSON_IN_SZ=640           : max input size before detection (downscale) for speed
     """
 
     def __init__(self):
         self.min_score = float(os.getenv("MIN_SCORE", "0.30"))
         self.nms_iou = float(os.getenv("NMS_IOU", "0.50"))
+        self.person_in_sz = int(os.getenv("PERSON_IN_SZ", "640"))
 
         self.use_memryx = MX_ENABLED
         self.mx = None
@@ -64,18 +66,30 @@ class PersonDetector:
             return self._infer_cpu(frame)
 
     # -------------------------------------------------------------------------
-    # MemryX path
+    # MemryX path (with internal downscale + rescale)
     # -------------------------------------------------------------------------
     def _infer_memryx(self, frame):
         """
         Runs the DFP on the accelerator and decodes outputs.
-        We support several common output layouts to make it robust to different YOLO DFP builds:
+        Supports several common output layouts to be robust to different YOLO DFP builds:
           A) dict with 'boxes' (N,4) and 'scores' (N,) in xyxy
-          B) single tensor (N,6) as [x1,y1,x2,y2,score,class]
+          B) single tensor (N,6 or 7) as [x1,y1,x2,y2,score,(class)]
           C) two unnamed tensors where one is (N,4) and the other is (N,) or (N,1)
+        Also performs optional downscale before inference (PERSON_IN_SZ), then rescales boxes back.
         """
+        h0, w0 = frame.shape[:2]
+        # Downscale for speed if needed
+        if self.person_in_sz > 0:
+            scale = self.person_in_sz / max(h0, w0)
+        else:
+            scale = 1.0
+        if scale < 1.0:
+            inp = cv2.resize(frame, (int(w0 * scale), int(h0 * scale)))
+        else:
+            inp = frame
+
         # 1) Run inference
-        mximg = MXImage(frame)               # MemryX helper wraps the numpy image
+        mximg = MXImage(inp)                 # MemryX helper wraps the numpy image
         outputs = self.mx.infer(mximg)       # returns dict[str, np.ndarray] or list-like
 
         # 2) Normalize to a dict for easier handling
@@ -87,56 +101,78 @@ class PersonDetector:
             # Unexpected; nothing we can do
             return []
 
+        dets = []
+
         # 3) Try the easy case first: keys 'boxes' and 'scores'
         if "boxes" in out_dict and "scores" in out_dict:
             boxes = np.asarray(out_dict["boxes"])
             scores = np.asarray(out_dict["scores"]).reshape(-1)
             dets = self._pack_and_filter(boxes, scores, self.min_score)
-            return self._nms(dets, iou_thresh=self.nms_iou)
 
         # 4) If there is a single tensor shaped (N,6 or 7) -> [x1,y1,x2,y2,score,(class)]
-        if len(out_dict) == 1:
+        elif len(out_dict) == 1:
             arr = next(iter(out_dict.values()))
             arr = np.asarray(arr)
             if arr.ndim == 2 and arr.shape[1] in (6, 7):
                 boxes = arr[:, 0:4]
                 scores = arr[:, 4]
                 dets = self._pack_and_filter(boxes, scores, self.min_score)
-                return self._nms(dets, iou_thresh=self.nms_iou)
 
         # 5) If there are exactly 2 arrays: try to guess which is boxes and which is scores
-        if len(out_dict) == 2:
+        elif len(out_dict) == 2:
             vals = list(out_dict.values())
             a, b = np.asarray(vals[0]), np.asarray(vals[1])
             # one of them (N,4), the other (N,) or (N,1)
             if a.ndim == 2 and a.shape[1] == 4 and b.ndim >= 1:
                 boxes, scores = a, b.reshape(-1)
+                dets = self._pack_and_filter(boxes, scores, self.min_score)
             elif b.ndim == 2 and b.shape[1] == 4 and a.ndim >= 1:
                 boxes, scores = b, a.reshape(-1)
-            else:
-                boxes, scores = None, None
-            if boxes is not None and scores is not None:
                 dets = self._pack_and_filter(boxes, scores, self.min_score)
-                return self._nms(dets, iou_thresh=self.nms_iou)
 
-        # 6) Could not auto-decode: return empty (or add custom decoder here)
-        #    If your DFP outputs a different layout, map it here and return the same format.
-        #    Example: convert center-based boxes to xyxy, etc.
-        return []
+        # If nothing matched, dets remains empty
+        if not dets:
+            return []
+
+        # 6) NMS
+        dets = self._nms(dets, iou_thresh=self.nms_iou)
+
+        # 7) Rescale boxes back to original frame size if we downscaled
+        if scale < 1.0:
+            inv = 1.0 / scale
+            for d in dets:
+                x1, y1, x2, y2 = d["box"]
+                d["box"] = (x1 * inv, y1 * inv, x2 * inv, y2 * inv)
+
+        return dets
 
     # -------------------------------------------------------------------------
-    # CPU fallback (OpenCV HOG)
+    # CPU fallback (OpenCV HOG) with the same downscale trick
     # -------------------------------------------------------------------------
     def _infer_cpu(self, frame):
+        h0, w0 = frame.shape[:2]
+        if self.person_in_sz > 0:
+            scale = self.person_in_sz / max(h0, w0)
+        else:
+            scale = 1.0
+        if scale < 1.0:
+            inp = cv2.resize(frame, (int(w0 * scale), int(h0 * scale)))
+        else:
+            inp = frame
+
         rects, weights = self.hog.detectMultiScale(
-            frame, winStride=(8, 8), padding=(8, 8), scale=1.05
+            inp, winStride=(8, 8), padding=(8, 8), scale=1.05
         )
         dets = []
         for (x, y, w, h), s in zip(rects, weights):
             x1, y1, x2, y2 = x, y, x + w, y + h
             if float(s) >= self.min_score:
+                # rescale to original frame coordinates if downscaled
+                if scale < 1.0:
+                    inv = 1.0 / scale
+                    x1, y1, x2, y2 = x1 * inv, y1 * inv, x2 * inv, y2 * inv
                 dets.append({"box": (x1, y1, x2, y2), "conf": float(s)})
-        return dets
+        return self._nms(dets, iou_thresh=self.nms_iou)
 
     # -------------------------------------------------------------------------
     # Helpers
