@@ -1,0 +1,34 @@
+global:
+  min_person_conf: 0.3
+  min_face_conf: 0.5
+  persistence_frames: 5
+  cooldown_seconds: 45
+
+rules:
+  - name: family_combo
+    when:
+      people_count: ">=3"
+    show: "ui/assets/ads/family_combo.jpg"
+
+  - name: coffee_energy
+    when:
+      age_range: [18, 35]
+      expression_any_of: ["neutral","tired"]
+      clothing_style_any_of: ["semi_formal","formal"]
+    show: "ui/assets/ads/coffee_promo.jpg"
+
+  - name: sporty_snacks
+    when:
+      clothing_style_any_of: ["sporty","bright"]
+      expression_any_of: ["happy","smile"]
+    show: "ui/assets/ads/sports_snacks.jpg"
+
+  - name: evening_takeaway
+    when:
+      time_of_day_any_of: ["evening","night"]
+      people_count: "==1"
+    show: "ui/assets/ads/takeaway_deal.jpg"
+
+guardrails:
+  ignore_children: true
+  save_media: false
