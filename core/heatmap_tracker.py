@@ -19,7 +19,9 @@ class HeatmapTracker:
         self.hot_thresh = hot_thresh
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
-        self.stats = defaultdict(lambda: {"visits": 0, "hot": 0, "avg_dwell": 0.0})
+        # grid بحجم (50px) لتجميع الإحصاءات
+        self.cell = 50
+        self.stats = defaultdict(lambda: {"visits": 0, "hot": 0, "avg_dwell": 0.0, "visit_weight": 0})
 
     def update(self, frame, tracked):
         now = time.time()
@@ -43,11 +45,17 @@ class HeatmapTracker:
                 dwell_time = now - self.stay_start[pid]
                 if dwell_time > self.dwell_thresh:
                     cv2.circle(self.heatmap, (cx, cy), 20, 1.0, -1)
-                    self.stats[(cx // 50, cy // 50)]["visits"] += 1
-                    self.stats[(cx // 50, cy // 50)]["avg_dwell"] = dwell_time
+                    key = (cx // self.cell, cy // self.cell)
+                    self.stats[key]["visits"] += 1
+                    # متوسط مرجّح حسب عدد الزيارات
+                    wprev = self.stats[key]["visit_weight"]
+                    avg_prev = self.stats[key]["avg_dwell"]
+                    wnew = wprev + 1
+                    self.stats[key]["avg_dwell"] = (avg_prev * wprev + dwell_time) / max(wnew, 1)
+                    self.stats[key]["visit_weight"] = wnew
                     if dwell_time > self.hot_thresh:
                         cv2.circle(self.heatmap, (cx, cy), 30, 2.0, -1)
-                        self.stats[(cx // 50, cy // 50)]["hot"] += 1
+                        self.stats[key]["hot"] += 1
             else:
                 self.stay_start.pop(pid, None)
 
@@ -65,11 +73,18 @@ class HeatmapTracker:
         summary = {
             "camera": self.cam_id,
             "generated_at": time.ctime(),
+            "cell_size_px": self.cell,
             "zones": [
-                {"zone": str(k), "visits": v["visits"], "hot_spots": v["hot"], "avg_dwell": round(v["avg_dwell"], 2)}
-                for k, v in self.stats.items()
+                {
+                    "zone": f"({k[0]},{k[1]})",
+                    "visits": v["visits"],
+                    "hot_spots": v["hot"],
+                    "avg_dwell": round(float(v["avg_dwell"]), 2)
+                }
+                for k, v in sorted(self.stats.items())
             ],
         }
         with open(report_path, "w") as f:
             json.dump(summary, f, indent=2)
         print(f"[HeatmapTracker] Saved heatmap report: {report_path}")
+        return report_path
