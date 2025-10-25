@@ -6,14 +6,21 @@ from core.ad_engine import AdEngine
 from core import utils as U
 from core.fusion import fuse
 from ui.display import Display
+from core.heatmap_tracker import HeatmapTracker
 import numpy as np
 
 # -----------------------------
 # Performance / Lite mode flags
 # -----------------------------
-FSKIP = int(os.getenv("FRAME_SKIP", "0"))            # عدد الإطارات التي تُتخطّى بين كل معالجة
-LITE_MODE = os.getenv("LITE_MODE", "0") == "1"       # وضع خفيف (اختياري)
-# ملاحظة: PERSON_IN_SZ يُستخدم داخل PersonDetector فقط إذا رغبت، لا نستخدمه هنا الآن
+FSKIP = int(os.getenv("FRAME_SKIP", "0"))          # عدد الإطارات التي تُتخطّى بين كل معالجة
+LITE_MODE = os.getenv("LITE_MODE", "0") == "1"     # وضع خفيف (اختياري)
+
+# -----------------------------
+# Heatmap controls (env vars)
+# -----------------------------
+DWELL_THRESH = float(os.getenv("DWELL_THRESH", "5"))     # يحسب زيارة بعد 5 ثواني وقوف
+HOT_THRESH   = float(os.getenv("HOT_THRESH", "10"))      # نقطة ساخنة بعد 10 ثواني
+HEAT_OUT_DIR = os.getenv("HEAT_OUT_DIR", "heatmap_reports")
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -29,7 +36,7 @@ def main():
 
     # Components
     person_det = PersonDetector()
-    # مع نسخة DeepFace الحالية، لا نحتاج det_size هنا
+    # مع DeepFace الحالية، لا نحتاج det_size هنا (FaceAttrs يستخدم ROI داخليًا)
     face_attr = FaceAttrs()
     tracker = IOUTracker(iou_thresh=0.4, max_age=30)
     ad_engine = AdEngine(args.config)
@@ -46,11 +53,30 @@ def main():
         print(f"Failed to open source: {args.source}")
         return
 
+    # Initialize heatmap tracker using the very first frame's shape
+    heatmap = None
+    ret, test_frame = cap.read()
+    if ret and test_frame is not None:
+        heatmap = HeatmapTracker(
+            test_frame.shape,
+            cam_id=str(args.source),
+            dwell_thresh=DWELL_THRESH,
+            hot_thresh=HOT_THRESH,
+            out_dir=HEAT_OUT_DIR
+        )
+        # إعادة مؤشر الفيديو للبداية (لو كان ملف)
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        except Exception:
+            pass
+    else:
+        print("[Heatmap] Warning: could not initialize heatmap (no test frame).")
+
     frame_index = 0
 
     while True:
         ok, frame = cap.read()
-        if not ok:
+        if not ok or frame is None:
             break
 
         # -----------------------------
@@ -69,11 +95,8 @@ def main():
 
         # -----------------------------
         # 2) Person detection (بدون أي تصغير هنا)
-        #    التصغير إن لزم يتم داخل PersonDetector فقط
         # -----------------------------
         dets = person_det.infer(frame) or []
-
-        # فلترة حسب الثقة
         dets = [d for d in dets if d.get('conf', 1.0) >= min_person_conf]
 
         # تتبّع
@@ -81,7 +104,13 @@ def main():
         boxes = [t['box'] for t in tracked]
 
         # -----------------------------
-        # 3) Face analysis (ROI داخل FaceAttrs لسرعة أعلى)
+        # 3) Heatmap update (قبل أي رسم)
+        # -----------------------------
+        if heatmap is not None:
+            heatmap.update(frame, tracked)
+
+        # -----------------------------
+        # 4) Face analysis (ROI داخل FaceAttrs لسرعة أعلى)
         # -----------------------------
         face_infos = face_attr.analyze(frame, boxes)
 
@@ -107,7 +136,12 @@ def main():
                 label = f"ID {p['id']} | {p['gender'] or 'NA'} | {p['age'] or 'NA'} | {p['expression']} | {p['clothing_style']}"
             U.draw_box(frame, p['box'], (0, 255, 0), label=label)
 
+        # UI render
         frame = disp.render(frame, enriched, face_infos, U)
+
+        # Heatmap overlay
+        if heatmap is not None:
+            frame = heatmap.render(frame)
 
         # عرض
         try:
@@ -119,6 +153,13 @@ def main():
             pass
 
         frame_index += 1
+
+    # حفظ تقرير الحرارة عند الخروج
+    try:
+        if heatmap is not None:
+            heatmap.save_report()
+    except Exception as e:
+        print(f"[Heatmap] Failed to save report: {e}")
 
     cap.release()
     cv2.destroyAllWindows()
